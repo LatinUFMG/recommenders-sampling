@@ -1,6 +1,8 @@
 # Copyright (c) Recommenders contributors.
 # Licensed under the MIT License.
 
+import json
+import os
 import numpy as np
 import pandas as pd
 import logging
@@ -47,12 +49,15 @@ class SARSingleNode:
         col_rating=constants.DEFAULT_RATING_COL,
         col_timestamp=constants.DEFAULT_TIMESTAMP_COL,
         col_prediction=constants.DEFAULT_PREDICTION_COL,
+        col_imprgroup=constants.DEFAULT_IMPRGROUP_COL,
+        col_isimpr=constants.DEFAULT_ISIMPR_COL,
         similarity_type=SIM_JACCARD,
         time_decay_coefficient=30,
         time_now=None,
         timedecay_formula=False,
         threshold=1,
         normalize=False,
+        *args, **kwargs
     ):
         """Initialize model parameters
 
@@ -62,6 +67,8 @@ class SARSingleNode:
             col_rating (str): rating column name
             col_timestamp (str): timestamp column name
             col_prediction (str): prediction column name
+            col_itemgroup (str): column used to "group" the positive and negative candidates for ranking.
+            col_isimpr (str): column used to filter real impressions from historical log.
             similarity_type (str): ['cooccurrence', 'cosine', 'inclusion index', 'jaccard',
               'lexicographers mutual information', 'lift', 'mutual information'] option for
               computing item-item similarity
@@ -76,6 +83,8 @@ class SARSingleNode:
         self.col_user = col_user
         self.col_timestamp = col_timestamp
         self.col_prediction = col_prediction
+        self.col_imprgroup = col_imprgroup
+        self.col_isimpr = col_isimpr
 
         available_similarity_types = [
             SIM_COOCCUR,
@@ -151,7 +160,7 @@ class SARSingleNode:
 
         return sparse.coo_matrix(
             (df[rating_col], (df[self.col_user_id], df[self.col_item_id])),
-            shape=(self.n_users, self.n_items),
+            shape=(self.n_users+1, self.n_items),
         ).tocsr()
 
     def compute_time_decay(self, df, decay_column):
@@ -212,8 +221,8 @@ class SARSingleNode:
         """
 
         # generate a map of continuous index values to items
-        self.index2item = dict(enumerate(df[self.col_item].unique()))
-        self.index2user = dict(enumerate(df[self.col_user].unique()))
+        self.index2item = dict(enumerate(df[self.col_item].unique().astype("str").tolist()))
+        self.index2user = dict(enumerate(df[self.col_user].unique().astype("str").tolist()))
 
         # invert the mappings from above
         self.item2index = {v: k for k, v in self.index2item.items()}
@@ -257,10 +266,10 @@ class SARSingleNode:
         logger.info("Creating index columns")
         # add mapping of user and item ids to indices
         temp_df.loc[:, self.col_item_id] = temp_df[self.col_item].apply(
-            lambda item: self.item2index.get(item, np.NaN)
+            lambda item: self.item2index.get(str(item), np.nan)
         )
         temp_df.loc[:, self.col_user_id] = temp_df[self.col_user].apply(
-            lambda user: self.user2index.get(user, np.NaN)
+            lambda user: self.user2index.get(str(user), np.nan)
         )
 
         if self.normalize:
@@ -334,14 +343,17 @@ class SARSingleNode:
         """
 
         # get user / item indices from test set
-        user_ids = list(
-            map(
-                lambda user: self.user2index.get(user, np.NaN),
-                test[self.col_user].unique(),
-            )
-        )
-        if any(np.isnan(user_ids)):
-            raise ValueError("SAR cannot score users that are not in the training set")
+        user_ids = np.asarray(list(map(
+            lambda user: self.user2index.get(str(user), np.nan),
+            test[self.col_user].unique(),
+        )))
+        nan_user_ids = np.isnan(user_ids)
+        if any(nan_user_ids):
+            logger.warn("SAR cannot score users that are not in the training set")
+
+        # Ignores not found user ids
+        user_ids[nan_user_ids] = self.n_users
+        user_ids = user_ids.astype("int64")
 
         # calculate raw scores with a matrix multiplication
         logger.info("Calculating recommendation scores")
@@ -352,7 +364,7 @@ class SARSingleNode:
             test_scores = test_scores.toarray()
 
         if self.normalize:
-            counts = self.unity_user_affinity[user_ids, :].dot(self.item_similarity)
+            counts = self.user_affinity[user_ids, :].dot(self.item_similarity)
             user_min_scores = (
                 np.tile(counts.min(axis=1)[:, np.newaxis], test_scores.shape[1])
                 * self.rating_min
@@ -374,7 +386,7 @@ class SARSingleNode:
             logger.info("Removing seen items")
             test_scores += self.user_affinity[user_ids, :] * -np.inf
 
-        return test_scores
+        return test_scores, user_ids
 
     def get_popularity_based_topk(self, top_k=10, sort_top_k=True, items=True):
         """Get top K most frequently occurring items across all users.
@@ -439,7 +451,7 @@ class SARSingleNode:
         item_ids = np.asarray(
             list(
                 map(
-                    lambda item: self.item2index.get(item, np.NaN),
+                    lambda item: self.item2index.get(str(item), np.nan),
                     items[self.col_item].values,
                 )
             )
@@ -454,7 +466,7 @@ class SARSingleNode:
         # create local map of user ids
         if self.col_user in items.columns:
             test_users = items[self.col_user]
-            user2index = {x[1]: x[0] for x in enumerate(items[self.col_user].unique())}
+            user2index = {str(x[1]): x[0] for x in enumerate(items[self.col_user].unique())}
             user_ids = test_users.map(user2index)
         else:
             # if no user column exists assume all entries are for a single user
@@ -494,14 +506,14 @@ class SARSingleNode:
         """Based on user affinity towards items, calculate the most similar users to the given user.
 
         Args:
-            user (int): user to retrieve most similar users for
+            user (any): user to retrieve most similar users for
             top_k (int): number of top items to recommend
             sort_top_k (bool): flag to sort top k results
 
         Returns:
             pandas.DataFrame: top k most similar users and their scores
         """
-        user_idx = self.user2index[user]
+        user_idx = self.user2index[str(user)]
         similarities = self.user_affinity[user_idx].dot(self.user_affinity.T).toarray()
         similarities[0, user_idx] = -np.inf
 
@@ -532,7 +544,7 @@ class SARSingleNode:
             pandas.DataFrame: top k recommendation items for each user
         """
 
-        test_scores = self.score(test, remove_seen=remove_seen)
+        test_scores, _ = self.score(test, remove_seen=remove_seen)
 
         top_items, top_scores = get_top_k_scored_items(
             scores=test_scores, top_k=top_k, sort_top_k=sort_top_k
@@ -561,39 +573,127 @@ class SARSingleNode:
             pandas.DataFrame: DataFrame contains the prediction results
         """
 
-        test_scores = self.score(test)
+        test_scores, scored_users = self.score(test)
         user_ids = np.asarray(
             list(
                 map(
-                    lambda user: self.user2index.get(user, np.NaN),
+                    lambda user: self.user2index.get(str(user), np.nan),
                     test[self.col_user].values,
                 )
             )
         )
 
+        # Ignores not found user ids
+        nan_user_ids = np.isnan(user_ids)
+        user_ids[nan_user_ids] = self.n_users
+        user_ids = user_ids.astype("int64")
+
         # create mapping of new items to zeros
         item_ids = np.asarray(
             list(
                 map(
-                    lambda item: self.item2index.get(item, np.NaN),
+                    lambda item: self.item2index.get(str(item), np.nan),
                     test[self.col_item].values,
                 )
             )
         )
         nans = np.isnan(item_ids)
         if any(nans):
-            logger.warning(
-                "Items found in test not seen during training, new items will have score of 0"
-            )
-            test_scores = np.append(test_scores, np.zeros((self.n_users, 1)), axis=1)
+            # logger.warning(
+            #     "Items found in test not seen during training, new items will have score of 0"
+            # )
+            test_scores = np.append(test_scores, np.zeros((len(test_scores), 1)), axis=1)
             item_ids[nans] = self.n_items
-            item_ids = item_ids.astype("int64")
+        item_ids = item_ids.astype("int64")
 
-        df = pd.DataFrame(
-            {
-                self.col_user: test[self.col_user].values,
-                self.col_item: test[self.col_item].values,
-                self.col_prediction: test_scores[user_ids, item_ids],
-            }
+        res = test.copy()
+        scored_users_map = {v: k for k, v in enumerate(scored_users)}
+        user_ids_in_test_scores = [scored_users_map[i] for i in user_ids]
+        res[self.col_prediction] = test_scores[user_ids_in_test_scores, item_ids]
+
+        # Randomize prediction for 0.0 items
+        def generate_rand_score(row):
+            # Combine user and item IDs into a string and hash it to create a seed
+            seed = int(f"{row[self.col_user]}{row[self.col_item]}")
+            rnd = np.random.default_rng(seed)  # Create a temporary RNG with the specific seed
+            return rnd.uniform(0, 0.01)  # Generate a random number in [0.0, 0.01)
+
+
+        zero_ids = res[self.col_prediction] == 0.0
+        if zero_ids.any():
+            res.loc[zero_ids, self.col_prediction] = res[zero_ids].apply(generate_rand_score, axis=1)
+
+        # Grant values over than randomization
+        res[self.col_prediction] = np.where(
+            ~zero_ids, res[self.col_prediction] + 0.02, res[self.col_prediction]
         )
-        return df
+
+        # Avoid negative scores
+        res[self.col_prediction] += abs(res[self.col_prediction].min()) + 0.01
+
+        return res
+
+    def save_model(self, filepath):
+        os.makedirs(filepath, exist_ok=True)
+
+        # Basic attributes
+        basic_attr = {
+            "index2item": self.index2item,
+            "n_items": self.n_items,
+            "item2index": self.item2index,
+            "index2user": self.index2user,
+            "n_users": self.n_users,
+            "user2index": self.user2index,
+            "time_now": self.time_now,
+            "similarity_type": self.similarity_type,
+            "rating_min": self.rating_min,
+            "rating_max": self.rating_max,
+        }
+
+        filename = os.path.join(filepath, "sar_attr.json")
+        with open(filename, "w") as fout:
+            json.dump({k: v for k, v in basic_attr.items() if v is not None}, fout)
+
+        if self.unity_user_affinity is not None:
+            filename = os.path.join(filepath, "unity_user_affinity.npz")
+            sparse.save_npz(filename, self.unity_user_affinity)
+        if self.user_affinity is not None:
+            filename = os.path.join(filepath, "user_affinity.npz")
+            sparse.save_npz(filename, self.user_affinity)
+        if self.item_frequencies is not None:
+            filename = os.path.join(filepath, "item_frequencies.npy")
+            np.save(filename, self.item_frequencies)
+        if self.item_similarity is not None:
+            filename = os.path.join(filepath, "item_similarity.npy")
+            np.save(filename, self.item_similarity)
+
+    def load_model(self, filepath):
+        """Load the model from a file.
+        Args:
+            filepath (str): Path to load the model from.
+        Returns:
+            bool: True if model successfully loaded, otherwise False.
+        """
+        try:
+            filename = os.path.join(filepath, "sar_attr.json")
+            with open(filename, "r") as fin:
+                basic_attr = json.load(fin)
+                for k, v in basic_attr.items():
+                    setattr(self, k, v)
+
+            filename = os.path.join(filepath, "unity_user_affinity.npz")
+            if os.path.exists(filename):
+                self.unity_user_affinity = sparse.load_npz(filename)
+            filename = os.path.join(filepath, "user_affinity.npz")
+            if os.path.exists(filename):
+                self.user_affinity = sparse.load_npz(filename)
+            filename = os.path.join(filepath, "item_frequencies.npy")
+            if os.path.exists(filename):
+                self.item_frequencies = np.load(filename)
+            filename = os.path.join(filepath, "item_similarity.npy")
+            if os.path.exists(filename):
+                self.item_similarity = np.load(filename)
+            return True
+        except Exception as ex:
+            print(ex)
+            return False

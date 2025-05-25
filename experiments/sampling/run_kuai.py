@@ -16,8 +16,6 @@ import sys
 import numpy as np
 import pandas as pd
 
-from pyspark.sql import functions as F
-from pyspark.sql import types as T
 from ray.internal import free as rayfree
 from ray.tune.search.hyperopt import HyperOptSearch
 from sklearn.model_selection import KFold

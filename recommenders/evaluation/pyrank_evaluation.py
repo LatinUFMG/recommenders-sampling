@@ -3,7 +3,6 @@ import re
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score, log_loss, mean_squared_error, accuracy_score, f1_score
-import torch
 from tqdm import tqdm
 
 from . import wtd_utils as wtd
@@ -11,18 +10,12 @@ from . import wtd_utils as wtd
 
 class Samplers(str, Enum):
     EXPOSED = "exposed"              # Exposed: Real negative candidates
-    # FULL = "full"                  # Full: All clicked news of the day as negative candidates
-    CNCFULL = "cncfull"              # Random: Sample at random a fixed N of negative candidates from all clicked news of the day
-    # RAIZFULL = "raizfull"          # RandExpo: Sample at random the same number of negatives equal to real exposed from all clicked news of the day
-    # RANDOM = "random"              # CNC Full: All clicked and non-clicked news of the day as negative candidates
-    CNCRANDOM = "cncrandom"          # CNC Random: Sample at random a fixed N of negative candidates from all clicked and non clicked news of the day
-    # RAIZRANDOM = "raizrandom"      # CNC RandExpo: Sample at random the same number of negatives equal to real exposed from all clicked and non-clicked news of the day
-    # RANDEXPO = "randexpo"          # Raiz Full: All available news as negative candidates
-    CNCRANDEXPO = "cncrandexpo"      # Raiz Random: Sample at random a fixed N of negative candidates from all available news
-    # RAIZRANDEXPO = "raizrandexpo"  # Raiz RandExpo: Sample at random the same number of negatives equal to the real exposed from all available news
+    CNCFULL = "cncfull"              # Full: All items (except positive) as negative candidates
+    CNCRANDOM = "cncrandom"          # Random: Sample at random a fixed N of negative candidates from all items (except positive)
+    CNCRANDEXPO = "cncrandexpo"      # RandExpo: Sample at random the same number of negatives equal to real exposed from all items (except positive)
     POPULARITY = "popularity"        # Popularity: Sample from the most presented items.
     POSITIVITY = "positivity"        # Positivity: Sample from the most liked items.
-    SKEW = "skew"                    # https://www.its.caltech.edu/~fehardt/UAI2016WS/papers/Liang.pdf - Close to popularity
+    SKEW = "skew"                    # https://www.its.caltech.edu/~fehardt/UAI2016WS/papers/Liang.pdf
     WTD = "wtd"                      # https://www.cs.ucc.ie/~dgb/papers/Carraro-Bridge-2019.pdf
     WTDH = "wtdh"                    # https://www.cs.ucc.ie/~dgb/papers/Carraro-Bridge-2019.pdf
 

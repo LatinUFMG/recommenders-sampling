@@ -41,8 +41,10 @@ install_requires = [
     "pandas>2.0.0,<3.0.0",  # requires numpy
     "pandera[strategies]>=0.6.5,<0.18;python_version<='3.8'",  # For generating fake datasets
     "pandera[strategies]>=0.15.0;python_version>='3.9'",
+    "pyspark>=3.5.1,<3.6",
     "retrying>=1.3.4,<2",
     "ray[tune]>=2.35.0,<3",
+    "bottleneck>=1.4.0,<2",
     "scikit-learn>=1.2.0,<2",  # requires scipy, and introduce breaking change affects feature_extraction.text.TfidfVectorizer.min_df
     "scikit-surprise>=1.1.3",
     "scipy>=1.10.1",

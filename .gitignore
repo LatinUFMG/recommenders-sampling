@@ -179,5 +179,6 @@ reports/
 ### pip folders
 pip-wheel*
 
-#####  sampling experiments data folder
+#####  sampling experiments data and exploratory analysis folders
 experiments/sampling/data
+experiments/sampling/exploratory

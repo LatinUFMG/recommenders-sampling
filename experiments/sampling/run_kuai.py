@@ -220,25 +220,6 @@ def objective(config, train, alg_class, fixed_params, user_features, item_featur
 
     return {TUNING_METRIC: avg_metric}
 
-# %% FIXME
-# import cProfile
-# import pandas as pd
-
-# with cProfile.Profile() as pr:
-#     print(objective(
-#         {
-#             "epochs": 22, "item_alpha": 0.0013497418544079415, "learning_schedule": "adadelta",
-#             "loss": "warp", "no_components": 161, "user_alpha": 2.2556222013174036e-06, "learning_rate": 0.002105326914839524,
-#         },
-#         train, LightFMFUModel, header, user_features, item_features
-#     ))
-# df = pd.DataFrame(
-#     pr.getstats(),
-#     columns=['func', 'ncalls', 'ccalls', 'tottime', 'cumtime', 'callers']
-# )
-# __import__('IPython').embed()
-# 0/0
-
 # %%
 for i, (alg_name, alg_class, alg_params) in enumerate(MODELS):
     train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
@@ -349,8 +330,6 @@ def auto_garbage_collect(pct=80.0):
     if psutil.virtual_memory().percent >= pct:
         gc.collect()
     return
-
-# %%
 
 # %%
 rnd = np.random.RandomState(42)

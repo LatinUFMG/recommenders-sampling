@@ -34,6 +34,12 @@ Navigate to the root directory of the project (where `setup.py` is located) and 
 pip install -e .
 ```
 
+or
+
+```bash
+pip install -e .[gpu]
+```
+
 ## Usage
 
 ---

@@ -23,31 +23,19 @@ from sklearn.model_selection import KFold
 
 from recommenders.datasets import kuai
 from recommenders.evaluation.pyrank_evaluation import Math, run_eval_as_ranking, Samplers
-from recommenders.models.expomf import FastExpoMFModel
-from recommenders.models.lightfm import LightFMFModel, LightFMModel, LightFMFUModel
+from recommenders.models.lightfm import LightFMFModel, LightFMModel
 from recommenders.models.implicit import ImplicitModel
 from recommenders.models.pop import ClickPOP
 from recommenders.models.rand import RandomModel
+from recommenders.models.sampling_adapters import SASRecAdapter, LightGCNAdapter, FastAIAdapter,EASEAdapter
 from recommenders.models.sar import SAR
-
-# New recommenders
-from recommenders.models.sampling_adapters import (
-    SASRecAdapter,
-    LightGCNAdapter,
-    FastAIAdapter,
-    EASEAdapter,
-)
-
 from recommenders.utils.constants import (
-    DEFAULT_GENRE_COL,
-    DEFAULT_HEADER,
     DEFAULT_IMPRGROUP_COL,
     DEFAULT_ITEM_COL,
     DEFAULT_ISIMPR_COL,
     DEFAULT_PREDICTION_COL,
     DEFAULT_RATING_COL,
     DEFAULT_TIMESTAMP_COL,
-    DEFAULT_TITLE_COL,
     DEFAULT_USER_COL,
 )
 from recommenders.utils.spark_utils import start_or_get_spark

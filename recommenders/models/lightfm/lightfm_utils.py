@@ -452,7 +452,6 @@ class LightFMModel:
 
         return res
 
-
     def save_model(self, filepath):
         """Save the model and related sparse matrices to a file.
         Args:
@@ -583,9 +582,9 @@ class LightFMFModel(LightFMModel):
         # df[id_col + "_diagonal"] = df[id_col]
         categorize_columns = list(df.columns)
         categorize_columns.remove(id_col)
-        df[categorize_columns] = (
-            df[categorize_columns].astype("str").radd(np.array(categorize_columns) + ":")
-        )
+        df[categorize_columns] = df[categorize_columns].astype(str)
+        for col in categorize_columns:
+            df[col] = col + ":" + df[col]
 
         unique_feature_values = []
         for c in categorize_columns:

@@ -210,22 +210,16 @@ def objective(config, train, alg_class, fixed_params, user_features, item_featur
     """
     metrics = []
     for train_fold_raw, val_fold_raw in interaction_kfold(train, n_splits=5, seed=42):
+        groupby_columns = [DEFAULT_USER_COL, DEFAULT_ITEM_COL]
+        # Train split
         if alg_class == SASRecAdapter:
-            # Train:
-            train_fold = (
-                train_fold_raw
-                .groupby([DEFAULT_TIMESTAMP_COL, DEFAULT_USER_COL, DEFAULT_ITEM_COL])
-                .agg({DEFAULT_RATING_COL: "sum"})
-                .reset_index()
-            )
-        else:
-            # Train:
-            train_fold = (
-                train_fold_raw
-                .groupby([DEFAULT_USER_COL, DEFAULT_ITEM_COL])
-                .agg({DEFAULT_RATING_COL: "sum"})
-                .reset_index()
-            )
+            groupby_columns.append(DEFAULT_TIMESTAMP_COL)
+        train_fold = (
+            train_fold_raw
+            .groupby(groupby_columns)
+            .agg({DEFAULT_RATING_COL: "sum"})
+            .reset_index()
+        )
 
         # Validation:
         val_fold = val_fold_raw.copy()
@@ -294,6 +288,7 @@ for i, (alg_name, alg_class, alg_params) in enumerate(MODELS):
         MODELS[i] = (alg_name, alg_class, {**alg_params, **best_params})
 
 # %%
+
 train_fold_with_time = (
     # Adds historic of clicks from users only in test set (validation (impressions) still preserved)
     pd.concat([train, test.query(f"~{DEFAULT_ISIMPR_COL}")])
@@ -311,7 +306,7 @@ train_fold_agg = (
 )
 for alg_name, alg_class, alg_params in MODELS:
     torch.cuda.empty_cache()
-    train_fold = train_fold if alg_class != SASRecAdapter else train_fold_with_time
+    train_fold = train_fold_agg if alg_class != SASRecAdapter else train_fold_with_time
     train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
     model_train_path = os.path.join(model_path, train_key)
     os.makedirs(model_train_path, exist_ok=True)

@@ -100,22 +100,16 @@ def objective(config, train, alg_class, fixed_params, user_features, item_featur
         train_fold_raw = train.iloc[train_index]
         val_fold_raw = train.iloc[val_index]
 
-        # Train fold:
+        # Train fold
+        groupby_columns = [DEFAULT_USER_COL, DEFAULT_ITEM_COL]
         if alg_class == SASRecAdapter:
-            # Train:
-            train_fold = (
-                train_fold_raw
-                .groupby([DEFAULT_TIMESTAMP_COL, DEFAULT_USER_COL, DEFAULT_ITEM_COL])
-                .agg({DEFAULT_RATING_COL: "sum"})
-                .reset_index()
-            )
-        else:
-            train_fold = (
-                train_fold_raw
-                .groupby([DEFAULT_USER_COL, DEFAULT_ITEM_COL])
-                .agg({DEFAULT_RATING_COL: "sum"})
-                .reset_index()
-            )
+            groupby_columns.append(DEFAULT_TIMESTAMP_COL)
+        train_fold = (
+            train_fold_raw
+            .groupby(groupby_columns)
+            .agg({DEFAULT_RATING_COL: "sum"})
+            .reset_index()
+        )
 
         # Validation fold:
         val_fold = val_fold_raw # .query(DEFAULT_ISIMPR_COL)
@@ -385,7 +379,7 @@ if __name__ == "__main__":
         .reset_index()
     )
 
-    train_fold_full = (
+    train_fold_agg = (
         pd.concat([train, test.query(f"~{DEFAULT_ISIMPR_COL}")])
         .groupby([DEFAULT_USER_COL, DEFAULT_ITEM_COL])
         .agg({DEFAULT_RATING_COL: "sum"})
@@ -395,7 +389,7 @@ if __name__ == "__main__":
     print("Executing Final Training...")
     for alg_name, alg_class, alg_params in tuned_models:
         torch.cuda.empty_cache()
-        train_fold_full = train_fold_full if alg_class != SASRecAdapter else train_fold_with_time
+        train_fold_full = train_fold_agg if alg_class != SASRecAdapter else train_fold_with_time
         train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
         model_train_path = os.path.join(model_path, train_key)
         os.makedirs(model_train_path, exist_ok=True)
@@ -412,7 +406,7 @@ if __name__ == "__main__":
     RANDOM_VARIATIONS = [0, 1, 2, 5, 10, 20, 50, 100, 200] #, 500, 1000]
     futures = []
 
-    train_rayid = ray.put(train_fold_full)
+    train_rayid = ray.put(train)
     test_rayid = ray.put(test)
 
     print("Submitting Evaluation Tasks...")
@@ -451,7 +445,8 @@ if __name__ == "__main__":
                 future = remote_run_predict.options(num_cpus=4, num_gpus=0.125).remote(
                     sampling_exp_type, sample_size, model_train_path,
                     alg_name, alg_class, alg_params,
-                    train_rayid, test_rayid,
+                    train_rayid,
+                    test_rayid,
                     result_key, results_file
                 )
                 futures.append(future)

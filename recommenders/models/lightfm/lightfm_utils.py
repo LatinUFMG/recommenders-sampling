@@ -6,7 +6,9 @@ import pandas as pd
 import numpy as np
 import pickle
 from scipy import sparse
+from scipy.sparse import hstack
 import seaborn as sns
+from sklearn.preprocessing import normalize, MinMaxScaler
 
 from lightfm.evaluation import precision_at_k, recall_at_k
 from lightfm import LightFM
@@ -409,36 +411,47 @@ class LightFMModel:
                         user_features=self.user_features
                     )
 
-        predictions += abs(predictions.min())
+        predictions += abs(predictions.min()) * 2
         predictions /= predictions.max()
 
         # Create a result DataFrame
         res = test.copy()
-        res[self.col_prediction] = predictions
 
-        # Randomized noise for granting the same order between executions in case of ties
-        def add_rand_noise(row, max_noise=1e-10):
-            # Combine user and item IDs into a string and hash it to create a seed
-            seed = int(f"{row[self.col_user]}{row[self.col_item]}")
-            rnd = np.random.default_rng(seed)  # Create a temporary RNG with the specific seed
-            return rnd.uniform(0, max_noise)  # Generate a random number in [0.0, max_noise)
+        # --- Deterministic Noise Logic ---
+        def get_deterministic_noise(row):
+            """Generates a tiny deterministic noise based on the User/Item pair."""
+            # The seed ensures the noise is identical for the same pair every time.
+            # This logic is strictly required to maintain consistency across executions.
+            try:
+                seed = int(f"{row[self.col_user]}{row[self.col_item]}")
+            except ValueError:
+                # Fallback: simple hash if IDs are not purely numeric strings suitable for int conversion
+                seed = hash(f"{row[self.col_user]}{row[self.col_item]}") % (2**32)
 
-        zero_ids = res[self.col_prediction] == 0.0
-        if zero_ids.any():
-            res.loc[zero_ids, self.col_prediction] = res[zero_ids].apply(add_rand_noise, axis=1)
+            rnd = np.random.default_rng(seed)
+            # Generate a very small number (between 0 and 1e-9) to act as a tie-breaker
+            # without affecting the model's ranking logic.
+            return rnd.uniform(0, 1e-9)
 
-        # Grant values over than randomization
-        res[self.col_prediction] = np.where(
-            ~zero_ids, res[self.col_prediction] + 0.02, res[self.col_prediction]
-        )
+        # Apply noise to ALL rows.
+        # This solves ties and ensures distinguishability without altering the macro order.
+        noise_values = res.apply(get_deterministic_noise, axis=1)
 
-        # Avoid negative scores
-        res[self.col_prediction] += abs(res[self.col_prediction].min()) + 0.01
+        # Add the noise to the raw predictions
+        res[self.col_prediction] = predictions + noise_values
 
-        # Avoid ties
-        res[self.col_prediction] += res.apply(add_rand_noise, axis=1)
+        # --- Positivity Guarantee (> 0) ---
+
+        # Find the current minimum score
+        min_score = res[self.col_prediction].min()
+
+        # If there are negative or zero values, shift the entire distribution upwards.
+        # We add a small epsilon (1e-5) to ensure the lowest value is strictly > 0.
+        if min_score <= 0:
+            res[self.col_prediction] += abs(min_score) + 1e-5
 
         return res
+
 
     def save_model(self, filepath):
         """Save the model and related sparse matrices to a file.
@@ -517,14 +530,23 @@ class LightFMModel:
 
 class LightFMFModel(LightFMModel):
     def get_raytune_space(model_name: str = "lightfmf"):
+        # default_space = {
+        #     "no_components": tune.randint(10, 201),  # Number of latent factors
+        #     "loss": tune.choice(["warp", "logistic"]),  # Loss function ["warp", "bpr", "logistic"]
+        #     "learning_schedule": tune.choice(["adadelta", "adagrad"]),  # Learning schedule ["adagrad", "adadelta"]
+        #     "learning_rate": tune.loguniform(3e-4, 1e-2),  # Learning rate step
+        #     "user_alpha": tune.loguniform(1e-4, 5e-1),  # Regularization for user factors
+        #     "item_alpha": tune.loguniform(1e-4, 5e-1),  # Regularization for item factors
+        #     "epochs": tune.randint(10, 51),  # Number of training epochs
+        # }
         default_space = {
-            "no_components": tune.randint(10, 201),  # Number of latent factors
-            "loss": tune.choice(["warp"]),  # Loss function ["bpr", "logistic"]
-            "learning_schedule": tune.choice(["adadelta"]),  # Learning schedule (adagrad)
-            "learning_rate": tune.loguniform(0.001, 0.01),  # Learning rate step
-            "user_alpha": tune.loguniform(1e-6, 1e-2),  # Regularization for user factors
-            "item_alpha": tune.loguniform(1e-6, 1e-2),  # Regularization for item factors
-            "epochs": tune.randint(10, 51),  # Number of training epochs
+            "no_components": tune.randint(32, 129),  # Number of latent factors
+            "loss": tune.choice(["warp"]),  # Loss function ["warp", "bpr", "logistic"]
+            "learning_schedule": tune.choice(["adagrad"]),  # Learning schedule ["adagrad", "adadelta"]
+            "learning_rate": tune.loguniform(5e-4, 3e-3),  # Learning rate step
+            "user_alpha": tune.loguniform(1e-6, 1e-3),  # Regularization for user factors
+            "item_alpha": tune.loguniform(1e-6, 1e-3),  # Regularization for item factors
+            "epochs": tune.randint(10, 30),  # Number of training epochs
         }
 
         return default_space
@@ -572,70 +594,150 @@ class LightFMFModel(LightFMModel):
         return df[id_col].values.tolist(), unique_feature_values, df
 
     def fitf(self, df, user_features, item_features):
-        """Main fit method for LightFMModel.
+        """Main fit method for LightFMModel."""
+        # Remove users/items with only zero interactions
+        df = df.loc[
+            df.groupby(self.col_user)[self.col_rating]
+            .transform(lambda x: not (x == 0).all())
+        ]
+        df = df.loc[
+            df.groupby(self.col_item)[self.col_rating]
+            .transform(lambda x: not (x == 0).all())
+        ]
 
-        Note:
-            Please make sure that `df` has no duplicates.
+        # Avoid duplications
+        df = (
+            df.groupby([self.col_user, self.col_item], as_index=False)
+            .agg({self.col_rating: "max"})
+        )
+        df[self.col_rating] = (df[self.col_rating] > 0).astype(np.int32)
 
-        Args:
-            df (pd.DataFrame): User item rating dataframe (without duplicates).
-            user_features (pd.DataFrame): Features representing the users.
-            item_features (pd.DataFrame): Features representing the items.
-        """
+        # Filter features to surviving IDs
+        user_features = user_features[
+            user_features[self.col_user].isin(df[self.col_user].unique())
+        ].copy()
+        item_features = item_features[
+            item_features[self.col_item].isin(df[self.col_item].unique())
+        ].copy()
 
-        # Identify userIDs where all ratings are 0
-        all_zero_users = df.groupby(self.col_user)[self.col_rating].transform(lambda x: (x == 0).all())
-        df = df[~all_zero_users].copy()
-
-        # Identify itemIDs where all ratings are 0
-        all_zero_items = df.groupby(self.col_item)[self.col_rating].transform(lambda x: (x == 0).all())
-        df = df[~all_zero_items].drop_duplicates()
-
-        # Filter user and item features based on remaining user and item IDs in df
-        filtered_user_ids = df[self.col_user].unique()
-        filtered_item_ids = df[self.col_item].unique()
-
-        # TODO: Allow only user or item features
-        user_features = user_features[user_features[self.col_user].isin(filtered_user_ids)].copy()
-        item_features = item_features[item_features[self.col_item].isin(filtered_item_ids)].copy()
-
-        # Ensure there are no NaN or infinite values in user and item features
+        # Drop NaN / inf
         user_features = user_features.replace([np.inf, -np.inf], np.nan).dropna()
         item_features = item_features.replace([np.inf, -np.inf], np.nan).dropna()
 
-        # Prepare user and item features
-        users, unique_user_features, user_features_dft = self.transform_features(
+        # Transform features (existing logic)
+        users, uniq_user_feats, user_dft = self.transform_features(
             user_features, self.col_user
         )
-        items, unique_items_features, item_features_dft = self.transform_features(
+        items, uniq_item_feats, item_dft = self.transform_features(
             item_features, self.col_item
         )
 
-        # Fit dataset
-        self.dataset.fit(users, items, unique_user_features, unique_items_features)
+        self.dataset.fit(users, items, uniq_user_feats, uniq_item_feats)
 
-        # Extract user and item feature arrays for faster processing
-        user_ids = user_features_dft[self.col_user].values
-        user_onlyfeatures = user_features_dft.drop(columns=[self.col_user]).values
-        item_ids = item_features_dft[self.col_item].values
-        item_onlyfeatures = item_features_dft.drop(columns=[self.col_item]).values
+        # Split numeric vs categorical
+        def split(df, id_col):
+            f = df.drop(columns=[id_col])
+            num = f.select_dtypes(include="number").astype(np.float32)
+            cat = f.select_dtypes(exclude="number")
+            return num, cat
 
-        # Build user and item features
+        user_num, user_cat = split(user_dft, self.col_user)
+        item_num, item_cat = split(item_dft, self.col_item)
+
+        user_ids = user_dft[self.col_user].values
+        item_ids = item_dft[self.col_item].values
+
+        # --- NUMERIC FEATURES ---
+        # Keep only high-variance numeric features (top K)
+        def select_numeric(df, max_feats=50):
+            if df.empty:
+                return df
+            var = df.var(axis=0).sort_values(ascending=False)
+            keep = var[var > 1e-4].head(max_feats).index
+            df = df[keep].clip(-3.0, 3.0)
+            df.values[:] = normalize(df.values, norm="l2", axis=1)
+            return df
+
+        user_num = select_numeric(user_num)
+        item_num = select_numeric(item_num)
+
+        # --- CATEGORICAL FEATURES ---
+        # Keep only very frequent categories (top K total)
+        def select_categorical(df, max_tokens=50):
+            if df.empty:
+                return df
+            counts = df.stack().value_counts()
+            keep = set(counts.head(max_tokens).index)
+            out = df.copy()
+            for c in out.columns:
+                out[c] = out[c].where(out[c].isin(keep), "")
+            return out
+
+        user_cat = select_categorical(user_cat)
+        item_cat = select_categorical(item_cat)
+
+        # Remove rows with near-zero numeric signal
+        def mask_rows(num_df):
+            if num_df.empty:
+                return np.ones(len(num_df), dtype=bool)
+            return np.linalg.norm(num_df.values, axis=1) > 1e-6
+
+        um = mask_rows(user_num)
+        im = mask_rows(item_num)
+
+        user_ids = user_ids[um]
+        user_num = user_num.loc[um]
+        user_cat = user_cat.loc[um]
+
+        item_ids = item_ids[im]
+        item_num = item_num.loc[im]
+        item_cat = item_cat.loc[im]
+
+        # Build LightFM feature tuples
+        def build(ids, num_df, cat_df):
+            rows = []
+            for i, nrow, crow in zip(ids, num_df.values, cat_df.values):
+                feats = []
+                for f, v in zip(num_df.columns, nrow):
+                    if v != 0:
+                        feats.append((f, float(v)))
+                for v in crow:
+                    if isinstance(v, str) and v != "":
+                        feats.append(v)
+                rows.append((i, feats))
+            return rows
+
         self.user_features = self.dataset.build_user_features(
-            list(zip(user_ids, user_onlyfeatures.tolist()))
+            build(user_ids, user_num, user_cat)
         )
         self.item_features = self.dataset.build_item_features(
-            list(zip(item_ids, item_onlyfeatures.tolist()))
+            build(item_ids, item_num, item_cat)
         )
 
-        # Create interaction matrix
-        self.interactions, self.weights = self.dataset.build_interactions(
+        # Add bias features
+        self.user_features = hstack(
+            [self.user_features,
+            np.ones((self.user_features.shape[0], 1), dtype=np.float32)],
+            format="csr"
+        )
+        self.item_features = hstack(
+            [self.item_features,
+            np.ones((self.item_features.shape[0], 1), dtype=np.float32)],
+            format="csr"
+        )
+
+        # Interactions and weights
+        self.interactions, _ = self.dataset.build_interactions(
             df[[self.col_user, self.col_item, self.col_rating]].values
         )
 
-        self.model = self.model.fit(
-            self.interactions, self.user_features, self.item_features,
-            sample_weight=self.weights, epochs=self.epochs, num_threads=4,
+        # Fit
+        self.model.fit(
+            self.interactions,
+            user_features=self.user_features,
+            item_features=self.item_features,
+            epochs=self.epochs,
+            num_threads=8,
         )
 
 
@@ -693,11 +795,10 @@ class LightFMFUModel(LightFMFModel):
         self.item_features = None
 
         # Create interaction matrix
-        self.interactions, self.weights = self.dataset.build_interactions(
+        self.interactions, _ = self.dataset.build_interactions(
             df[[self.col_user, self.col_item, self.col_rating]].values
         )
 
         self.model = self.model.fit(
-            self.interactions, self.user_features,
-            sample_weight=self.weights, epochs=self.epochs, num_threads=4,
+            self.interactions, self.user_features, epochs=self.epochs, num_threads=4
         )

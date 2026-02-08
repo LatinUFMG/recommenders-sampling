@@ -15,6 +15,7 @@ import scipy
 import sys
 import numpy as np
 import pandas as pd
+import torch
 
 from ray.internal import free as rayfree
 from ray.tune.search.hyperopt import HyperOptSearch
@@ -22,11 +23,21 @@ from sklearn.model_selection import KFold
 
 from recommenders.datasets import kuai
 from recommenders.evaluation.pyrank_evaluation import Math, run_eval_as_ranking, Samplers
+from recommenders.models.expomf import FastExpoMFModel
 from recommenders.models.lightfm import LightFMFModel, LightFMModel, LightFMFUModel
 from recommenders.models.implicit import ImplicitModel
 from recommenders.models.pop import ClickPOP
 from recommenders.models.rand import RandomModel
 from recommenders.models.sar import SAR
+
+# New recommenders
+from recommenders.models.sampling_adapters import (
+    SASRecAdapter,
+    LightGCNAdapter,
+    FastAIAdapter,
+    EASEAdapter,
+)
+
 from recommenders.utils.constants import (
     DEFAULT_GENRE_COL,
     DEFAULT_HEADER,
@@ -182,42 +193,70 @@ MODELS = [
     ("bpr", ImplicitModel, header),
     ("lightfm", LightFMModel, header),  # no fatures
     ("lightfmf", LightFMFModel, header),  # with features
+    ("sasrec", SASRecAdapter, header),
+    ("lightgcn", LightGCNAdapter, header),
+    ("fastai", FastAIAdapter, header),
+    ("ease", EASEAdapter, header),
 ]
 
-# %%
-def objective(config, train, alg_class, fixed_params, user_features, item_features):
-    kf = KFold(n_splits=5)
-    unique_users = train[DEFAULT_USER_COL].unique()
-    metrics = []
+# %% Core Logic
+def interaction_kfold(df, n_splits=5, seed=42):
+    """
+    Generator that yields (train_df, val_df) interaction-level KFold splits.
+    """
+    df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
 
-    for train_index, val_index in kf.split(unique_users):
-        train_fold_users = unique_users[train_index]
-        val_fold_users = unique_users[val_index]
-        train_fold = (
-            pd.concat([
-                train[train[DEFAULT_USER_COL].isin(train_fold_users)],
-                # Return only historic of clicks
-                train[train[DEFAULT_USER_COL].isin(val_fold_users)].query(f"~{DEFAULT_ISIMPR_COL}")
-            ])
-            .groupby([DEFAULT_USER_COL, DEFAULT_ITEM_COL])
-            .agg({DEFAULT_RATING_COL: "sum"})
-            .reset_index()
-        )
-        val_fold = train[train[DEFAULT_USER_COL].isin(val_fold_users)].query(DEFAULT_ISIMPR_COL)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+
+    indices = np.arange(len(df))
+
+    for train_idx, val_idx in kf.split(indices):
+        train_df = df.iloc[train_idx]
+        val_df = df.iloc[val_idx]
+        yield train_df, val_df
+
+
+def objective(config, train, alg_class, fixed_params, user_features, item_features):
+    """
+    Ray Tune objective function using K-Fold cross-validation.
+    """
+    metrics = []
+    for train_fold_raw, val_fold_raw in interaction_kfold(train, n_splits=5, seed=42):
+        if alg_class == SASRecAdapter:
+            # Train:
+            train_fold = (
+                train_fold_raw
+                .groupby([DEFAULT_TIMESTAMP_COL, DEFAULT_USER_COL, DEFAULT_ITEM_COL])
+                .agg({DEFAULT_RATING_COL: "sum"})
+                .reset_index()
+            )
+        else:
+            # Train:
+            train_fold = (
+                train_fold_raw
+                .groupby([DEFAULT_USER_COL, DEFAULT_ITEM_COL])
+                .agg({DEFAULT_RATING_COL: "sum"})
+                .reset_index()
+            )
+
+        # Validation:
+        val_fold = val_fold_raw.copy()
+
         all_params = {**fixed_params, **config}
         model = alg_class(**all_params)
+
         if hasattr(model, "fitf"):
             model.fitf(train_fold, user_features, item_features)
         else:
             model.fit(train_fold)
+
         result = run_eval_as_ranking(
-            model, train_fold, val_fold, metrics=[TUNING_METRIC], sampler_type="cncrandom", sample_size=100
+            model, train_fold, val_fold, metrics=[TUNING_METRIC],
+            sampler_type="cncrandom", sample_size=100
         )
         metrics.append(result[TUNING_METRIC])
 
-    # Average the metric across folds
     avg_metric = np.mean(metrics)
-
     return {TUNING_METRIC: avg_metric}
 
 # %%
@@ -230,7 +269,7 @@ for i, (alg_name, alg_class, alg_params) in enumerate(MODELS):
     tuning_path = os.path.join(model_train_path, tuning_name)
     if hasattr(alg_class, "get_raytune_space"):
         objective_fn = ray.tune.with_parameters(
-            ray.tune.with_resources(objective, {"cpu": 4, "gpu": 0.125}),
+            ray.tune.with_resources(objective, {"cpu": 4, "gpu": 0.25}),
             train=train, alg_class=alg_class, fixed_params=alg_params,
             user_features=user_features, item_features=item_features,
         )
@@ -267,7 +306,15 @@ for i, (alg_name, alg_class, alg_params) in enumerate(MODELS):
         MODELS[i] = (alg_name, alg_class, {**alg_params, **best_params})
 
 # %%
-train_fold = (
+train_fold_with_time = (
+    # Adds historic of clicks from users only in test set (validation (impressions) still preserved)
+    pd.concat([train, test.query(f"~{DEFAULT_ISIMPR_COL}")])
+    .groupby([DEFAULT_TIMESTAMP_COL, DEFAULT_USER_COL, DEFAULT_ITEM_COL])
+    .agg({DEFAULT_RATING_COL: "sum"})
+    .reset_index()
+)
+
+train_fold_agg = (
     # Adds historic of clicks from users only in test set (validation (impressions) still preserved)
     pd.concat([train, test.query(f"~{DEFAULT_ISIMPR_COL}")])
     .groupby([DEFAULT_USER_COL, DEFAULT_ITEM_COL])
@@ -275,6 +322,8 @@ train_fold = (
     .reset_index()
 )
 for alg_name, alg_class, alg_params in MODELS:
+    torch.cuda.empty_cache()
+    train_fold = train_fold if alg_class != SASRecAdapter else train_fold_with_time
     train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
     model_train_path = os.path.join(model_path, train_key)
     os.makedirs(model_train_path, exist_ok=True)
@@ -477,7 +526,7 @@ for bias_model in BIAS_MODELS:
 
                     # Submit tasks to ray
                     num_cpus = 4
-                    future = remote_run_predict.options(num_cpus=num_cpus, num_gpus=0.125).remote(
+                    future = remote_run_predict.options(num_cpus=num_cpus, num_gpus=0.5).remote(
                         sampling_exp_type, sample_size, model_train_path,
                         alg_name, alg_class, alg_params,
                         train_rayid, test_rayid, mar_rayid,

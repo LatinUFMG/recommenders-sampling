@@ -6,6 +6,7 @@ from sklearn.metrics import roc_auc_score, log_loss, mean_squared_error, accurac
 from tqdm import tqdm
 
 from . import wtd_utils as wtd
+from ..utils.constants import DEFAULT_PROPENSITY_COL
 
 
 class Samplers(str, Enum):
@@ -237,14 +238,6 @@ def run_eval_as_ranking(model, train, test, metrics, sampler_type, sample_size=N
             test, sampler_type, model.col_item, model.col_rating, model.col_isimpr
         )
 
-        pscore_dict = {}
-        if train is not None:
-            pscore_indexes, item_freq = np.unique(
-                test.query(f"{model.col_rating} == 1")[model.col_item], return_counts=True
-            )
-            pscore = (item_freq / item_freq.max()) ** 0.5
-            pscore_dict = dict(zip(pscore_indexes, pscore))
-
         user_weights = {}
         item_weights = {}
         use_ideal = False
@@ -262,11 +255,25 @@ def run_eval_as_ranking(model, train, test, metrics, sampler_type, sample_size=N
         candidates_to_sample = candidates_to_sample.query(f"{model.col_isimpr}")
         candidates_to_sample = candidates_to_sample.drop([model.col_isimpr], axis=1).set_index(model.col_item)
 
+        pscore_dict = {}
+        agg_test_cols = {model.col_item: lambda x: list(x), model.col_rating: lambda x: list(x)}
+        if DEFAULT_PROPENSITY_COL not in test.columns:
+            # Estimate pscore
+            # https://github.com/usaito/unbiased-implicit-rec-real/blob/master/src/data/preprocessor.py#L34
+            if train is not None:
+                pscore_indexes, item_freq = np.unique(
+                    test.query(f"{model.col_rating} == 1")[model.col_item], return_counts=True
+                )
+                pscore = (item_freq / item_freq.max()) ** 0.5
+                pscore_dict = dict(zip(pscore_indexes, pscore))
+        else:
+            agg_test_cols[DEFAULT_PROPENSITY_COL] = lambda x: list(x)
+
         tests_group = (
             test
             .query(f"{model.col_isimpr}")
             .groupby([model.col_user, model.col_imprgroup])
-            .agg({model.col_item: lambda x: list(x), model.col_rating: lambda x: list(x)})
+            .agg(agg_test_cols)
             .reset_index()
         )
 
@@ -300,7 +307,8 @@ def run_eval_as_ranking(model, train, test, metrics, sampler_type, sample_size=N
             predictions = model.predict(chunk_df.explode([model.col_item, model.col_rating]))
 
             # Map the propensity score
-            predictions["pscore"] = predictions[model.col_item].map(pscore_dict)
+            if DEFAULT_PROPENSITY_COL not in predictions.columns:
+                predictions[DEFAULT_PROPENSITY_COL] = predictions[model.col_item].map(pscore_dict)
 
             # Append the results to group_labels and group_preds
             test_labels_preds = (
@@ -310,7 +318,7 @@ def run_eval_as_ranking(model, train, test, metrics, sampler_type, sample_size=N
                     model.col_item: lambda x: list(x),
                     model.col_rating: lambda x: list(x),
                     model.col_prediction: lambda x: list(x),
-                    "pscore": lambda x: list(x),
+                    DEFAULT_PROPENSITY_COL: lambda x: list(x),
                     # model.col_item + "_bkp": "first",
                     # model.col_rating + "_bkp": "first",
                 })
@@ -327,14 +335,11 @@ def run_eval_as_ranking(model, train, test, metrics, sampler_type, sample_size=N
             test_labels_preds["evaluation"] = evaluation_metrics
             test_labels_preds["size_candidates"] = test_labels_preds[model.col_item].str.len()
             test_labels_preds["sum_rating"] = test_labels_preds[model.col_rating].apply(sum)
-            test_labels_preds = (
-                test_labels_preds
-                .drop([model.col_item, model.col_prediction, model.col_rating, "pscore"], axis=1)
-                # .rename({
-                #     model.col_item + "_bkp": model.col_item,
-                #     model.col_rating + "_bkp": model.col_rating
-                # }, axis=1)
-            )
+
+            cols_to_drop = [model.col_item, model.col_prediction, model.col_rating]
+            if len(pscore_dict) > 0:
+                cols_to_drop.append(DEFAULT_PROPENSITY_COL)
+            test_labels_preds = test_labels_preds.drop(cols_to_drop, axis=1)
             list_returndf.append(test_labels_preds)
 
         returndf_final = pd.concat(list_returndf)
@@ -424,7 +429,9 @@ def dcg_score(y_true, y_score, k=10):
 def unbiased_dcg_score(
     y_true: list, y_score: list, k: int, pscore: list = None
 ) -> float:
-    """Calculate a DCG score for a given user."""
+    """Calculate a DCG score for a given user.
+    https://github.com/usaito/unbiased-implicit-rec-real
+    """
     eps = 10e-3  # pscore clipping
     y_true_sorted_by_score = np.take(y_true, np.argsort(y_score)[::-1])
 

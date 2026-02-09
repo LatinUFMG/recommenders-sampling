@@ -358,8 +358,12 @@ if __name__ == "__main__":
         ("random", RandomModel, HEADER),
         ("als", ImplicitModel, HEADER),
         ("bpr", ImplicitModel, HEADER),
-        ("lightfm", LightFMModel, HEADER),
-        ("lightfmf", LightFMFModel, HEADER),
+        ("lightfm", LightFMModel, HEADER),  # no fatures
+        ("lightfmf", LightFMFModel, HEADER),  # with features
+        ("sasrec", SASRecAdapter, HEADER),
+        ("lightgcn", LightGCNAdapter, HEADER),
+        ("fastai", FastAIAdapter, HEADER),
+        ("ease", EASEAdapter, HEADER),
     ]
 
     # 9. Ray Initialization

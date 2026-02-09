@@ -557,27 +557,40 @@ class LightGCNAdapter:
 
     def save_model(self, path):
         os.makedirs(path, exist_ok=True)
-        basic_attr = {
-            "index2item": self.index2item,
-            "index2user": self.index2user,
-            "embed_size": self.hparams.embed_size,
-            "n_layers": self.hparams.n_layers
-        }
-        with open(os.path.join(path, "lightgcn_attr.json"), "w") as fout:
-            json.dump(basic_attr, fout)
-        self.model.save(os.path.join(path, "lightgcn_model"))
+
+        # Save TF checkpoint
+        ckpt_path = os.path.join(path, "lightgcn.ckpt")
+        self.model.saver.save(self.model.sess, ckpt_path)
+
+        # Save adapter metadata
+        with open(os.path.join(path, "lightgcn_attr.json"), "w") as f:
+            json.dump(
+                {
+                    "index2user": self.index2user,
+                    "index2item": self.index2item,
+                    "embed_size": self.hparams.embed_size,
+                    "n_layers": self.hparams.n_layers,
+                    "decay": self.hparams.decay,
+                },
+                f,
+            )
 
     def load_model(self, path):
         try:
-            with open(os.path.join(path, "lightgcn_attr.json"), "r") as fin:
-                attr = json.load(fin)
-                self.index2item = attr["index2item"]
+            with open(os.path.join(path, "lightgcn_attr.json"), "r") as f:
+                attr = json.load(f)
                 self.index2user = attr["index2user"]
-                self.user2index = {v: k for k, v in self.index2user.items()}
-                self.item2index = {v: k for k, v in self.index2item.items()}
+                self.index2item = attr["index2item"]
+                self.user2index = {v: int(k) for k, v in self.index2user.items()}
+                self.item2index = {v: int(k) for k, v in self.index2item.items()}
+
+            ckpt_path = os.path.join(path, "lightgcn.ckpt")
+            self.model.saver.restore(self.model.sess, ckpt_path)
             return True
-        except:
+        except Exception as e:
+            print(f"LightGCN load error: {e}")
             return False
+
 
 
 # ==============================================================================

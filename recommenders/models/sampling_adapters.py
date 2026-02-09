@@ -577,20 +577,42 @@ class LightGCNAdapter:
 
     def load_model(self, path):
         try:
+            # 1. Load adapter metadata
             with open(os.path.join(path, "lightgcn_attr.json"), "r") as f:
                 attr = json.load(f)
-                self.index2user = attr["index2user"]
-                self.index2item = attr["index2item"]
-                self.user2index = {v: int(k) for k, v in self.index2user.items()}
-                self.item2index = {v: int(k) for k, v in self.index2item.items()}
 
+            self.index2user = attr["index2user"]
+            self.index2item = attr["index2item"]
+            self.user2index = {v: int(k) for k, v in self.index2user.items()}
+            self.item2index = {v: int(k) for k, v in self.index2item.items()}
+
+            # 2. Rebuild ImplicitCF with EMPTY data just to create graph
+            dummy_df = pd.DataFrame(
+                {
+                    self.col_user: list(self.user2index.keys()),
+                    self.col_item: [next(iter(self.item2index.keys()))] * len(self.user2index),
+                    self.col_rating: np.zeros(len(self.user2index), dtype=np.float32),
+                }
+            )
+
+            data = ImplicitCF(
+                train=dummy_df,
+                col_user=self.col_user,
+                col_item=self.col_item,
+                col_rating=self.col_rating,
+                seed=self.seed
+            )
+
+            # 3. Rebuild LightGCN graph
+            self.model = LightGCN(self.hparams, data, seed=self.seed)
+
+            # 4. Restore TF checkpoint
             ckpt_path = os.path.join(path, "lightgcn.ckpt")
             self.model.saver.restore(self.model.sess, ckpt_path)
             return True
         except Exception as e:
             print(f"LightGCN load error: {e}")
             return False
-
 
 
 # ==============================================================================

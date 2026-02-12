@@ -750,36 +750,44 @@ class FastAIAdapter:
         self.model.fit_one_cycle(self.epochs, self.lr, cbs=[CSVLogger()])
 
     def predict(self, test):
+        # 1. Keep original df untouched
+        orig_df = test.copy()
         test_df = test.copy()
 
-        # Ensure string types for categories
+        # 2. Convert ONLY for fastai inference
         test_df[self.col_user] = test_df[self.col_user].astype(str)
         test_df[self.col_item] = test_df[self.col_item].astype(str)
 
-        # Ensure rating is scalar float
         if self.col_rating in test_df.columns:
-            test_df[self.col_rating] = (
-                test_df[self.col_rating]
-                .astype(float)
-            )
+            test_df[self.col_rating] = test_df[self.col_rating].astype(float)
 
-        # Remove target from test_dl
+        # 3. Build test dataloader
         test_dl = self.model.dls.test_dl(
             test_df,
             with_labels=False
         )
 
+        # 4. Predict
         preds = self.model.get_preds(dl=test_dl)[0]
+        preds = preds.detach().cpu().numpy().flatten().astype("float32")
 
-        test_df[self.col_prediction] = preds.cpu().numpy().flatten()
-        test_df = apply_prediction_noise(
-            test_df,
+        # 5. Attach predictions to ORIGINAL df
+        result_df = orig_df.copy()
+        result_df[self.col_prediction] = preds
+
+        # Ensure original dtypes preserved (Arrow-safe)
+        result_df[self.col_user] = orig_df[self.col_user].astype(orig_df[self.col_user].dtype)
+        result_df[self.col_item] = orig_df[self.col_item].astype(orig_df[self.col_item].dtype)
+
+        # 6. Tie-breaking noise
+        result_df = apply_prediction_noise(
+            result_df,
             self.col_user,
             self.col_item,
             self.col_prediction
         )
 
-        return test_df
+        return result_df
 
     def save_model(self, path):
         os.makedirs(path, exist_ok=True)

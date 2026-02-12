@@ -539,14 +539,20 @@ for file_to_merge in os.listdir(results_path):
         group_files[group_key].append(file_to_merge)
     except IndexError:
         continue
+    except Exception as e:
+        print(file_to_merge)
+        raise e
 
 # Save group files
-for group_key, files_to_merge in group_files.items():
-    results_to_merge = []
-    for file_to_merge in files_to_merge:
-        results_to_merge.append(pd.read_parquet(os.path.join(results_path, file_to_merge)))
-
-    pd.concat(results_to_merge).to_parquet(final_results_path.replace(".parquet", f"_{group_key}.parquet"))
+try:
+    for group_key, files_to_merge in group_files.items():
+        results_to_merge = []
+        for file_to_merge in files_to_merge:
+            results_to_merge.append(pd.read_parquet(os.path.join(results_path, file_to_merge)))
+        pd.concat(results_to_merge).to_parquet(final_results_path.replace(".parquet", f"_{group_key}.parquet"))
+except Exception as e:
+    print(file_to_merge)
+    raise e
 
 # Save single file
 results_to_merge = []

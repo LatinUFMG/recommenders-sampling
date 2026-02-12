@@ -2,6 +2,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
+import pickle
 import scipy.sparse as sparse
 import tensorflow as tf
 import torch
@@ -217,6 +218,8 @@ class SASRecAdapter:
         self.dataset = SASRecDataSet(filename=tmp_file)
         self.dataset.split()
 
+        self.user_train = self.dataset.user_train
+
         # 3. Create Fast DataLoader
         # We replace WarpSampler with a PyTorch DataLoader
         train_ds = SASRecTrainDataset(self.dataset.user_train, self.dataset.itemnum, self.max_seq_length)
@@ -272,6 +275,8 @@ class SASRecAdapter:
 
     def predict(self, test):
         df = test.copy()
+
+        # 1. Map users/items to internal indices
         df[self.col_user] = df[self.col_user].astype(str).map(self.user2index)
         df[self.col_item] = df[self.col_item].astype(str).map(self.item2index)
 
@@ -285,53 +290,86 @@ class SASRecAdapter:
             valid_df = df[mask]
             user_ids = valid_df[self.col_user].astype(int).values
             item_ids = valid_df[self.col_item].astype(int).values
+            write_idx = np.flatnonzero(mask)
 
-            # Pre-compute history sequences once (Optimized)
+            # 2. Build history map once per unique user
             unique_users = np.unique(user_ids)
             user_history_map = {}
-            for u in unique_users:
-                hist = self.dataset.user_train.get(u, [])
-                user_history_map[u] = hist[-self.max_seq_length:]
 
-            # Construct sequences
+            for u in unique_users:
+                hist = self.user_train.get(u, [])
+                if not isinstance(hist, (list, np.ndarray)):
+                    hist = []
+                # Safe truncation
+                hist = hist[-self.max_seq_length:]
+                user_history_map[u] = hist
+
+            # 3. Construct padded sequences
             seqs = np.zeros((len(user_ids), self.max_seq_length), dtype=np.int64)
+
             for i, u in enumerate(user_ids):
                 h = user_history_map.get(u, [])
-                seqs[i, -len(h):] = h
+                l = len(h)
+                if l > 0:
+                    seqs[i, -l:] = h
 
-            # Batched Inference
-            batch_size = self.batch_size * 2 # Can use larger batch for inference
-            num_batches = (len(user_ids) + batch_size - 1) // batch_size
-            all_preds = []
+            # 4. Skip empty sequences (prevents NaNs)
+            valid_seq_mask = np.any(seqs != 0, axis=1)
 
-            with torch.no_grad():
-                for i in range(num_batches):
-                    start = i * batch_size
-                    end = start + batch_size
-                    b_seq = torch.LongTensor(seqs[start:end]).to(device)
-                    b_items = torch.LongTensor(item_ids[start:end]).to(device)
+            if valid_seq_mask.any():
+                seqs_valid = seqs[valid_seq_mask]
+                items_valid = item_ids[valid_seq_mask]
+                write_idx_valid = write_idx[valid_seq_mask]
 
-                    features = self.model(b_seq)
-                    final_feat = features[:, -1, :]
-                    item_embs = self.model.item_emb(b_items)
+                batch_size = self.batch_size * 2
+                num_batches = (len(seqs_valid) + batch_size - 1) // batch_size
+                all_preds = []
 
-                    logits = (final_feat * item_embs).sum(dim=-1)
-                    all_preds.append(logits.cpu().numpy())
+                with torch.no_grad():
+                    for b in range(num_batches):
+                        start = b * batch_size
+                        end = start + batch_size
 
-            scores[mask.values] = np.concatenate(all_preds)
+                        b_seq = torch.LongTensor(seqs_valid[start:end]).to(device)
+                        b_items = torch.LongTensor(items_valid[start:end]).to(device)
 
+                        features = self.model(b_seq)
+                        final_feat = features[:, -1, :]
+                        item_embs = self.model.item_emb(b_items)
+
+                        logits = (final_feat * item_embs).sum(dim=-1)
+                        all_preds.append(logits.cpu().numpy())
+
+                scores[write_idx_valid] = np.concatenate(all_preds)
+
+            # Empty-history users keep score = 0.0 (safe baseline)
+
+        # 5. Finalize predictions
         df[self.col_prediction] = scores
-        df = apply_prediction_noise(df, self.col_user, self.col_item, self.col_prediction)
 
+        # Tie-safe noise injection
+        df = apply_prediction_noise(
+            df,
+            self.col_user,
+            self.col_item,
+            self.col_prediction
+        )
+
+        # Restore original external IDs
         df[self.col_user] = test[self.col_user]
         df[self.col_item] = test[self.col_item]
+
         return df
+
 
     def save_model(self, path):
         os.makedirs(path, exist_ok=True)
         torch.save(self.model.state_dict(), os.path.join(path, "sasrec.pt"))
+        with open(os.path.join(path, "sasrec_dataset.pkl"), "wb") as f:
+            pickle.dump(self.dataset, f)
         with open(os.path.join(path, "sasrec_meta.json"), "w") as f:
             json.dump({
+                "user_train": self.user_train,
                 "index2user": self.index2user, "index2item": self.index2item,
                 "max_seq_length": self.max_seq_length, "hidden_units": self.hidden_units,
                 "num_blocks": self.num_blocks, "num_heads": self.num_heads,
@@ -342,6 +380,7 @@ class SASRecAdapter:
         try:
             with open(os.path.join(path, "sasrec_meta.json")) as f:
                 meta = json.load(f)
+            self.user_train = meta["user_train"]
             self.index2user = meta["index2user"]
             self.index2item = meta["index2item"]
             self.user2index = {v: int(k) for k, v in self.index2user.items()}
@@ -359,6 +398,10 @@ class SASRecAdapter:
             )
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.model.load_state_dict(torch.load(os.path.join(path, "sasrec.pt"), map_location=device))
+
+            with open(os.path.join(path, "sasrec_dataset.pkl"), "rb") as f:
+                self.dataset = pickle.load(f)
+
             self.model.to(device)
             self.model.eval()
             return True
@@ -516,6 +559,7 @@ class LightGCNAdapter:
         self.model = LightGCN(self.hparams, data, seed=self.seed)
         self.model.run_eval = lambda *args, **kwargs: None
         self.model.fit()
+        self.train_df = df.copy()
 
     def predict(self, test: pd.DataFrame):
         df = test.copy()
@@ -558,11 +602,19 @@ class LightGCNAdapter:
     def save_model(self, path):
         os.makedirs(path, exist_ok=True)
 
-        # Save TF checkpoint
+        # -----------------------------------------
+        # 1. Save TF checkpoint
+        # -----------------------------------------
         ckpt_path = os.path.join(path, "lightgcn.ckpt")
-        self.model.saver.save(self.model.sess, ckpt_path)
+        saver = tf.compat.v1.train.Saver(
+            var_list=tf.compat.v1.trainable_variables()
+        )
+        saver.save(self.model.sess, ckpt_path)
 
-        # Save adapter metadata
+
+        # -----------------------------------------
+        # 2. Save adapter metadata
+        # -----------------------------------------
         with open(os.path.join(path, "lightgcn_attr.json"), "w") as f:
             json.dump(
                 {
@@ -575,9 +627,21 @@ class LightGCNAdapter:
                 f,
             )
 
+        # -----------------------------------------
+        # 3. Save training dataframe
+        # -----------------------------------------
+        train_path = os.path.join(path, "lightgcn_train.pkl")
+        with open(train_path, "wb") as f:
+            pickle.dump(self.train_df, f)
+
     def load_model(self, path):
         try:
-            # 1. Load adapter metadata
+            import tensorflow as tf
+
+            tf.compat.v1.reset_default_graph()
+            # -----------------------------------------
+            # 1. Load metadata
+            # -----------------------------------------
             with open(os.path.join(path, "lightgcn_attr.json"), "r") as f:
                 attr = json.load(f)
 
@@ -586,33 +650,43 @@ class LightGCNAdapter:
             self.user2index = {v: int(k) for k, v in self.index2user.items()}
             self.item2index = {v: int(k) for k, v in self.index2item.items()}
 
-            # 2. Rebuild ImplicitCF with EMPTY data just to create graph
-            dummy_df = pd.DataFrame(
-                {
-                    self.col_user: list(self.user2index.keys()),
-                    self.col_item: [next(iter(self.item2index.keys()))] * len(self.user2index),
-                    self.col_rating: np.zeros(len(self.user2index), dtype=np.float32),
-                }
-            )
+            # -----------------------------------------
+            # 2. Load original training dataframe
+            # -----------------------------------------
+            with open(os.path.join(path, "lightgcn_train.pkl"), "rb") as f:
+                self.train_df = pickle.load(f)
 
+            # -----------------------------------------
+            # 3. Rebuild ImplicitCF with REAL data
+            # -----------------------------------------
             data = ImplicitCF(
-                train=dummy_df,
+                train=self.train_df,
                 col_user=self.col_user,
                 col_item=self.col_item,
                 col_rating=self.col_rating,
                 seed=self.seed
             )
 
-            # 3. Rebuild LightGCN graph
+            # -----------------------------------------
+            # 4. Rebuild LightGCN graph
+            # -----------------------------------------
             self.model = LightGCN(self.hparams, data, seed=self.seed)
 
-            # 4. Restore TF checkpoint
+            # -----------------------------------------
+            # 5. Restore checkpoint
+            # -----------------------------------------
             ckpt_path = os.path.join(path, "lightgcn.ckpt")
-            self.model.saver.restore(self.model.sess, ckpt_path)
+            saver = tf.compat.v1.train.Saver(
+                var_list=tf.compat.v1.trainable_variables()
+            )
+            saver.restore(self.model.sess, ckpt_path)
+
             return True
+
         except Exception as e:
             print(f"LightGCN load error: {e}")
             return False
+
 
 
 # ==============================================================================

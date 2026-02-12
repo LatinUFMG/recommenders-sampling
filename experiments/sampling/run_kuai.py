@@ -397,7 +397,7 @@ def rnd_choice(r, rnd, size):
 # %%
 RANDOM_VARIATIONS = [0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
 BIAS_PERCENTAGE = np.arange(0.0, 1.0, 0.1).tolist() + [0.85, 0.95]
-BIAS_MODELS = ["random", "popularity", "positivity", "marpop", "marpos"]
+BIAS_MODELS = ["random", "marpop", "marpos"]  # "popularity", "positivity"
 
 # Sample MAR items
 unique_item_ids = test[DEFAULT_ITEM_COL].unique().tolist()
@@ -509,7 +509,7 @@ for bias_model in BIAS_MODELS:
 
                     # Submit tasks to ray
                     num_cpus = 4
-                    future = remote_run_predict.options(num_cpus=num_cpus, num_gpus=0.5).remote(
+                    future = remote_run_predict.options(num_cpus=num_cpus, num_gpus=0.125).remote(
                         sampling_exp_type, sample_size, model_train_path,
                         alg_name, alg_class, alg_params,
                         train_rayid, test_rayid, mar_rayid,

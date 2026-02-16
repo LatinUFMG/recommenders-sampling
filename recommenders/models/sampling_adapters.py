@@ -137,13 +137,13 @@ class SASRecTrainDataset(Dataset):
         u, input_seq, pos, seq_set = self.samples[idx]
 
         # Vectorized Negative Sampling (Much faster than simple loops)
-        neg = np.random.randint(1, self.itemnum + 1, size=len(pos))
+        neg = self._rnd.randint(1, self.itemnum + 1, size=len(pos))
 
         # Fast collision check
         # For typical sparse datasets, collision rate is < 0.1%, so this loop rarely runs
         for i, val in enumerate(neg):
             while val in seq_set:
-                val = np.random.randint(1, self.itemnum + 1)
+                val = self._rnd.randint(1, self.itemnum + 1)
                 neg[i] = val
 
         return torch.tensor(u), torch.LongTensor(input_seq), torch.LongTensor(pos), torch.LongTensor(neg)
@@ -449,6 +449,7 @@ class LightGCNAdapter:
         self.hparams.MODEL_DIR = "."
 
         self.seed = seed
+        self._rnd = np.random.RandomState(self.seed)
 
         self.user2index = None
         self.item2index = None
@@ -486,6 +487,9 @@ class LightGCNAdapter:
         }
 
     def fit(self, df: pd.DataFrame):
+        import tensorflow as tf
+        tf.compat.v1.reset_default_graph()
+
         # 1. Rebuild indices every fit (MANDATORY under CV / Ray)
         self.set_index(df)
 
@@ -511,12 +515,15 @@ class LightGCNAdapter:
             col_rating=self.col_rating,
             seed=self.seed
         )
+        self.user2index = data.user2id
+        self.item2index = data.item2id
+        self.index2user = {v: k for k, v in self.user2index.items()}
+        self.index2item = {v: k for k, v in self.item2index.items()}
 
         orig_train_loader = data.train_loader
 
         def safe_train_loader(batch_size):
-            import random
-            # users WITH at least one interaction
+            # Users WITH at least one interaction
             valid_df = data.interact_status[
                 data.interact_status[self.col_item + "_interacted"]
                 .apply(len) > 0
@@ -527,31 +534,34 @@ class LightGCNAdapter:
 
             valid_users = valid_df[self.col_user].values
 
-            if len(valid_users) < batch_size:
-                users = np.random.choice(valid_users, batch_size, replace=True)
-            else:
-                users = np.random.choice(valid_users, batch_size, replace=False)
+            # Always sample with replacement (safer for CV folds)
+            users = self._rnd.choice(valid_users, batch_size, replace=True)
 
-            # select by VALUE, not POSITION
-            interact = valid_df[valid_df[self.col_user].isin(users)]
+            pos_items = []
+            neg_items = []
 
-            pos_items = interact[self.col_item + "_interacted"].apply(
-                lambda x: random.choice(list(x))
-            )
+            for u in users:
+                interacted = valid_df.loc[
+                    valid_df[self.col_user] == u,
+                    self.col_item + "_interacted"
+                ].values[0]
 
-            def sample_neg(x):
+                # Positive
+                pos_items.append(self._rnd.choice(list(interacted)))
+
+                # Negative
                 while True:
-                    neg_id = random.randint(0, data.n_items - 1)
-                    if neg_id not in x:
-                        return neg_id
-
-            neg_items = interact[self.col_item + "_interacted"].apply(sample_neg)
+                    neg = self._rnd.randint(0, data.n_items - 1)
+                    if neg not in interacted:
+                        neg_items.append(neg)
+                        break
 
             return (
                 users.astype(np.int64),
                 np.array(pos_items, dtype=np.int64),
                 np.array(neg_items, dtype=np.int64),
             )
+
 
         data.train_loader = safe_train_loader
 
@@ -600,6 +610,7 @@ class LightGCNAdapter:
         return df
 
     def save_model(self, path):
+        import tensorflow as tf
         os.makedirs(path, exist_ok=True)
 
         # -----------------------------------------
@@ -686,7 +697,6 @@ class LightGCNAdapter:
         except Exception as e:
             print(f"LightGCN load error: {e}")
             return False
-
 
 
 # ==============================================================================

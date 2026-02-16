@@ -140,6 +140,9 @@ def tune_and_load_models(models, train, user_features, item_features, model_base
     final_models = []
 
     for alg_name, alg_class, alg_params in models:
+        if DEFAULT_TIMESTAMP_COL not in train.columns and alg_class == SASRecAdapter:
+            continue
+
         train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
         model_train_path = os.path.join(model_base_path, train_key)
         os.makedirs(model_train_path, exist_ok=True)
@@ -374,14 +377,16 @@ if __name__ == "__main__":
     # 10. Tune and Train
     tuned_models = tune_and_load_models(MODELS, train, user_features, item_features, model_path)
 
-    # 11. Final Training (Full Train + Test Clicks)
-    train_fold_with_time = (
-        # Adds historic of clicks from users only in test set (validation (impressions) still preserved)
-        pd.concat([train, test.query(f"~{DEFAULT_ISIMPR_COL}")])
-        .groupby([DEFAULT_TIMESTAMP_COL, DEFAULT_USER_COL, DEFAULT_ITEM_COL])
-        .agg({DEFAULT_RATING_COL: "sum"})
-        .reset_index()
-    )
+    train_fold_with_time = None
+    if DEFAULT_TIMESTAMP_COL in train.columns:
+        # 11. Final Training (Full Train + Test Clicks)
+        train_fold_with_time = (
+            # Adds historic of clicks from users only in test set (validation (impressions) still preserved)
+            pd.concat([train, test.query(f"~{DEFAULT_ISIMPR_COL}")])
+            .groupby([DEFAULT_TIMESTAMP_COL, DEFAULT_USER_COL, DEFAULT_ITEM_COL])
+            .agg({DEFAULT_RATING_COL: "sum"})
+            .reset_index()
+        )
 
     train_fold_agg = (
         pd.concat([train, test.query(f"~{DEFAULT_ISIMPR_COL}")])
@@ -394,6 +399,8 @@ if __name__ == "__main__":
     for alg_name, alg_class, alg_params in tuned_models:
         torch.cuda.empty_cache()
         train_fold_full = train_fold_agg if alg_class != SASRecAdapter else train_fold_with_time
+        if train_fold_full is None:
+            continue
         train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
         model_train_path = os.path.join(model_path, train_key)
         os.makedirs(model_train_path, exist_ok=True)

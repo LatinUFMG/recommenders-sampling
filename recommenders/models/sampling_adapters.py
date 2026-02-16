@@ -17,8 +17,6 @@ from .sasrec.model import SASREC
 from .sasrec.util import SASRecDataSet
 from .sasrec.sampler import WarpSampler
 from .vae.standard_vae import StandardVAE
-from .ncf.ncf_singlenode import NCF
-from .ncf.dataset import Dataset as NCFDataset
 from .deeprec.models.graphrec.lightgcn import LightGCN
 from .deeprec.DataModel.ImplicitCF import ImplicitCF
 from fastai.collab import collab_learner, CollabDataLoaders
@@ -105,11 +103,13 @@ class SASRecTrainDataset(Dataset):
     """
     Optimized Dataset that pre-computes sequences and uses vectorized negative sampling.
     """
-    def __init__(self, user_train, itemnum, max_len):
+    def __init__(self, user_train, itemnum, max_len, seed=42):
         self.user_train = user_train
         self.users = sorted(list(user_train.keys()))
         self.itemnum = itemnum
         self.max_len = max_len
+        self.seed = seed
+        self._rnd = np.random.RandomState(self.seed)
 
         # Pre-compute static data structure to save CPU during training
         # (user, input_seq, target_pos, set_of_items_for_neg_check)
@@ -222,7 +222,7 @@ class SASRecAdapter:
 
         # 3. Create Fast DataLoader
         # We replace WarpSampler with a PyTorch DataLoader
-        train_ds = SASRecTrainDataset(self.dataset.user_train, self.dataset.itemnum, self.max_seq_length)
+        train_ds = SASRecTrainDataset(self.dataset.user_train, self.dataset.itemnum, self.max_seq_length, self.seed)
         # num_workers=0 ensures safety within Ray/Multiprocessing, but shuffle=True ensures good mixing
         # You can try num_workers=2 if not running inside Ray Tune
         train_loader = DataLoader(train_ds, batch_size=self.batch_size, shuffle=True, num_workers=0, pin_memory=True)

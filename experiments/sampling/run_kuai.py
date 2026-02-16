@@ -27,7 +27,7 @@ from recommenders.models.lightfm import LightFMFModel, LightFMModel
 from recommenders.models.implicit import ImplicitModel
 from recommenders.models.pop import ClickPOP
 from recommenders.models.rand import RandomModel
-from recommenders.models.sampling_adapters import SASRecAdapter, LightGCNAdapter, FastAIAdapter,EASEAdapter
+from recommenders.models.sampling_adapters import SASRecAdapter, LightGCNAdapter, FastAIAdapter, EASEAdapter
 from recommenders.models.sar import SAR
 from recommenders.utils.constants import (
     DEFAULT_IMPRGROUP_COL,
@@ -62,7 +62,7 @@ kuai_source = "rec"
 
 # %%
 # Download and load data
-data_path = f"./data/Kuai{kuai_source.capitalize()}"
+data_path = f"/mnt/dados02/{os.environ['USER']}/sampling/data/Kuai{kuai_source.capitalize()}"
 
 train_path = os.path.join(data_path, "train")
 if not os.path.exists(train_path) or len(os.listdir(train_path)) == 0:
@@ -99,6 +99,10 @@ arg_parser.add_argument(
     "--ignore_coverage_filter", action="store_false", default=True,
     help="Don't apply the filter to keep items with 100\% user coverage (default: %(default)s)"
 )
+arg_parser.add_argument(
+    "--hparam_seed", type=int, default=None,
+    help="If set, disable tuning and sample hyperparameters once using this seed. Requires a first execution with tuning enable."
+)
 args = arg_parser.parse_args()
 
 # %%
@@ -108,6 +112,9 @@ try:
     print(f"Continue execution with {exec_dt} prefix.")
 except ValueError:
     print(f"Starting new execution with {exec_dt} prefix.")
+
+HPARAM_SEED = args.hparam_seed
+ENABLE_TUNING = HPARAM_SEED is None
 
 results_path = os.path.join(data_path, "result", exec_dt)
 os.makedirs(results_path, exist_ok=True)
@@ -249,14 +256,14 @@ for i, (alg_name, alg_class, alg_params) in enumerate(MODELS):
 
     tuning_name = f"{alg_name}_tuning"
     tuning_path = os.path.join(model_train_path, tuning_name)
-    if hasattr(alg_class, "get_raytune_space"):
+    abs_tuning_path = os.path.abspath(tuning_path)
+    if hasattr(alg_class, "get_raytune_space") and ENABLE_TUNING:
         objective_fn = ray.tune.with_parameters(
             ray.tune.with_resources(objective, {"cpu": 4, "gpu": 0.25}),
             train=train, alg_class=alg_class, fixed_params=alg_params,
             user_features=user_features, item_features=item_features,
         )
         tuner = None
-        abs_tuning_path = os.path.abspath(tuning_path)
         best_params_path = os.path.join(tuning_path, "final_best_params.json")
         best_params = {}
         if not os.path.exists(best_params_path):
@@ -286,6 +293,34 @@ for i, (alg_name, alg_class, alg_params) in enumerate(MODELS):
             with open(best_params_path, "r") as reader:
                 best_params = json.load(reader)
         MODELS[i] = (alg_name, alg_class, {**alg_params, **best_params})
+    elif hasattr(alg_class, "get_raytune_space") and not ENABLE_TUNING:
+        try:
+            if not ray.tune.Tuner.can_restore(abs_tuning_path):
+                raise FileNotFoundError(
+                    f"No tuning results found for {alg_name} at {abs_tuning_path}"
+                )
+
+            tuner = ray.tune.Tuner.restore(abs_tuning_path)
+
+            results = tuner.get_results()
+
+            # Keep only finished successful trials
+            valid_trials = [r for r in results if r.error is None and TUNING_METRIC in r.metrics]
+
+            if len(valid_trials) == 0:
+                raise Exception(f"No valid tuning trials for {alg_name}")
+
+            rnd2 = np.random.RandomState(HPARAM_SEED)
+            selected_trial = valid_trials[rnd2.randint(len(valid_trials))]
+            selected_config = selected_trial.config
+        except:
+            selected_config = {}
+
+        MODELS[i] = (
+            alg_name,
+            alg_class,
+            {**alg_params, **selected_config}
+        )
 
 # %%
 
@@ -307,7 +342,10 @@ train_fold_agg = (
 for alg_name, alg_class, alg_params in MODELS:
     torch.cuda.empty_cache()
     train_fold = train_fold_agg if alg_class != SASRecAdapter else train_fold_with_time
-    train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
+    if ENABLE_TUNING:
+        train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
+    else:
+        train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}_seed{HPARAM_SEED}"
     model_train_path = os.path.join(model_path, train_key)
     os.makedirs(model_train_path, exist_ok=True)
 
@@ -401,7 +439,7 @@ BIAS_MODELS = ["random", "marpop", "marpos"]  # "popularity", "positivity"
 
 # Sample MAR items
 unique_item_ids = test[DEFAULT_ITEM_COL].unique().tolist()
-# Reserver 10% of items to MAR
+# Reserve 10% of items to MAR
 mar_unique_item_ids = rnd.choice(unique_item_ids, int(len(unique_item_ids) * 0.1), replace=False)
 mar = test.query(DEFAULT_ITEM_COL + " in @mar_unique_item_ids").copy()
 mar_rayid = None
@@ -412,6 +450,7 @@ for bias_model in BIAS_MODELS:
     for bias_p in BIAS_PERCENTAGE:
         biased_test = test.copy()
 
+        # This makes WTD and WTDH equivalent to Random (since the items that have information are not in the test)
         if bias_model in ["marpop", "marpos"]:
             # Remove MAR items
             biased_test = biased_test.query(DEFAULT_ITEM_COL + " not in @mar_unique_item_ids")
@@ -475,7 +514,10 @@ for bias_model in BIAS_MODELS:
 
         test_rayid = ray.put(biased_test_final)
         for alg_name, alg_class, alg_params in MODELS:
-            train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
+            if ENABLE_TUNING:
+                train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
+            else:
+                train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}_seed{HPARAM_SEED}"
             model_train_path = os.path.join(model_path, train_key)
 
             for sampling_exp_type in Samplers:
@@ -501,11 +543,12 @@ for bias_model in BIAS_MODELS:
 
                     # Enable sequentially running
                     # run_predict(
-                    #     sampling_exp_type, sample_size, model_train_path,
+                    #     Samplers.WTD, 1000, model_train_path,
                     #     alg_name, alg_class, alg_params,
                     #     train, biased_test_final, mar if mar_rayid is not None else None,
                     #     result_key, results_file
                     # )
+                    # 0/0
 
                     # Submit tasks to ray
                     num_cpus = 4
@@ -532,7 +575,7 @@ final_results_path = os.path.join(results_path, exec_dt + ".parquet")
 group_files = {}
 for file_to_merge in os.listdir(results_path):
     try:
-        group_key = file_to_merge.split("_")[2].split(":")[0]  # bias model
+        group_key = file_to_merge.split("-test_")[1].split(":")[0]  # bias model
         group_key = ''.join([c for c in group_key if not c.isdigit()])
         if group_key not in group_files:
             group_files[group_key] = []

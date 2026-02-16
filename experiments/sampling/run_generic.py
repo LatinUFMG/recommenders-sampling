@@ -23,12 +23,12 @@ from ray.tune.search.hyperopt import HyperOptSearch
 from sklearn.model_selection import KFold
 
 # Recommenders dependencies
-from recommenders.evaluation.pyrank_evaluation import Math, run_eval_as_ranking, Samplers
+from recommenders.evaluation.pyrank_evaluation import run_eval_as_ranking, Samplers
 from recommenders.models.lightfm import LightFMFModel, LightFMModel
 from recommenders.models.implicit import ImplicitModel
 from recommenders.models.pop import ClickPOP
 from recommenders.models.rand import RandomModel
-from recommenders.models.sampling_adapters import SASRecAdapter, LightGCNAdapter, FastAIAdapter,EASEAdapter
+from recommenders.models.sampling_adapters import SASRecAdapter, LightGCNAdapter, FastAIAdapter, EASEAdapter
 from recommenders.models.sar import SAR
 from recommenders.utils.constants import (
     DEFAULT_IMPRGROUP_COL,
@@ -117,8 +117,11 @@ def objective(config, train, alg_class, fixed_params, user_features, item_featur
         all_params = {**fixed_params, **config}
         model = alg_class(**all_params)
 
-        if hasattr(model, "fitf") and (user_features is not None or item_features is not None):
-            model.fitf(train_fold, user_features, item_features)
+        if hasattr(model, "fitf"):
+            if user_features is not None or item_features is not None:
+                model.fitf(train_fold, user_features, item_features)
+            else:
+                continue
         else:
             model.fit(train_fold)
 
@@ -142,6 +145,9 @@ def tune_and_load_models(models, train, user_features, item_features, model_base
     for alg_name, alg_class, alg_params in models:
         if DEFAULT_TIMESTAMP_COL not in train.columns and alg_class == SASRecAdapter:
             continue
+        if hasattr(alg_class, "fitf"):
+            if user_features is None and item_features is None:
+                continue
 
         train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
         model_train_path = os.path.join(model_base_path, train_key)
@@ -153,7 +159,7 @@ def tune_and_load_models(models, train, user_features, item_features, model_base
         best_params = {}
 
         # Run Tuning if supported
-        if hasattr(alg_class, "get_raytune_space"):
+        if hasattr(alg_class, "get_raytune_space") and ENABLE_TUNING:
             if not os.path.exists(best_params_path):
                 print(f"Tuning {alg_name}...")
 
@@ -196,6 +202,28 @@ def tune_and_load_models(models, train, user_features, item_features, model_base
                 print(f"Loading best params for {alg_name}...")
                 with open(best_params_path, "r") as reader:
                     best_params = json.load(reader)
+        elif hasattr(alg_class, "get_raytune_space") and not ENABLE_TUNING:
+            try:
+                if not ray.tune.Tuner.can_restore(abs_tuning_path):
+                    raise FileNotFoundError(
+                        f"No tuning results found for {alg_name} at {abs_tuning_path}"
+                    )
+
+                tuner = ray.tune.Tuner.restore(abs_tuning_path)
+
+                results = tuner.get_results()
+
+                # Keep only finished successful trials
+                valid_trials = [r for r in results if r.error is None and TUNING_METRIC in r.metrics]
+
+                if len(valid_trials) == 0:
+                    raise Exception(f"No valid tuning trials for {alg_name}")
+
+                rnd2 = np.random.RandomState(HPARAM_SEED)
+                selected_trial = valid_trials[rnd2.randint(len(valid_trials))]
+                best_params = selected_trial.config
+            except:
+                best_params = {}
 
         final_models.append((alg_name, alg_class, {**alg_params, **best_params}))
 
@@ -254,8 +282,15 @@ if __name__ == "__main__":
         "--ignore_coverage_filter", action="store_false", default=True,
         help="Don't apply the filter to keep items with 100%% user coverage (default: %(default)s)"
     )
+    parser.add_argument(
+        "--hparam_seed", type=int, default=None,
+        help="If set, disable tuning and sample hyperparameters once using this seed. Requires a first execution with tuning enable."
+    )
 
     args = parser.parse_args()
+
+    HPARAM_SEED = args.hparam_seed
+    ENABLE_TUNING = HPARAM_SEED is None
 
     # 1. Load Dataset Module Dynamically
     dataset_name = args.dataset
@@ -266,7 +301,7 @@ if __name__ == "__main__":
     spark.conf.set("spark.sql.analyzer.failAmbiguousSelfJoin", "false")
 
     # 3. Setup Paths and Data
-    data_path = f"./data/{dataset_name}"
+    data_path = f"/mnt/dados02/{os.environ['USER']}/sampling/data/{dataset_name}"
     train_path = os.path.join(data_path, "train")
     valid_path = os.path.join(data_path, "valid")
     utils_path = os.path.join(data_path, "utils")
@@ -401,14 +436,24 @@ if __name__ == "__main__":
         train_fold_full = train_fold_agg if alg_class != SASRecAdapter else train_fold_with_time
         if train_fold_full is None:
             continue
-        train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
+        if hasattr(alg_class, "fitf"):
+            if user_features is None and item_features is None:
+                continue
+
+        if ENABLE_TUNING:
+            train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
+        else:
+            train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}_seed{HPARAM_SEED}"
         model_train_path = os.path.join(model_path, train_key)
         os.makedirs(model_train_path, exist_ok=True)
 
         model = alg_class(**alg_params)
         if not model.load_model(model_train_path):
-            if hasattr(model, "fitf") and (user_features is not None or item_features is not None):
-                model.fitf(train_fold_full, user_features, item_features)
+            if hasattr(model, "fitf"):
+                if user_features is not None or item_features is not None:
+                    model.fitf(train_fold_full, user_features, item_features)
+                else:
+                    continue
             else:
                 model.fit(train_fold_full)
             model.save_model(model_train_path)
@@ -422,7 +467,10 @@ if __name__ == "__main__":
 
     print("Submitting Evaluation Tasks...")
     for alg_name, alg_class, alg_params in tuned_models:
-        train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
+        if ENABLE_TUNING:
+            train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}"
+        else:
+            train_key = f"{alg_name}_{SAMPLING_TRAIN_TYPE}_seed{HPARAM_SEED}"
         model_train_path = os.path.join(model_path, train_key)
 
         for sampling_exp_type in Samplers:

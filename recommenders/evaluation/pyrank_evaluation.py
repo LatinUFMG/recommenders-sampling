@@ -246,9 +246,9 @@ def run_eval_as_ranking(model, train, test, metrics, sampler_type, sample_size=N
             mar_df = mar.copy() if mar is not None else test.copy()
             if sampler_type == Samplers.WTDH:
                 use_ideal = True
-                mar_df = test.copy()
+                mar_df = test.copy()  # WTDH dont use, only estimate from train
             user_weights, item_weights = wtd.calculate_weights(
-                test, mar_df, use_ideal,
+                train, mar_df, use_ideal,
                 test[model.col_user].unique().tolist(), test[model.col_item].unique().tolist()
             )
 

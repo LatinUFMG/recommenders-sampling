@@ -28,13 +28,12 @@ conda activate sampling_experiments
 
 ### 3. Install Dependencies
 
-Navigate to the root directory of the project (where `setup.py` is located) and install the project dependencies using pip:
-
+First, downgrade pip to version 25.0, as this is required to ensure compatibility with LightFM.
 ```bash
-pip install -e .
+pip install --force pip==25
 ```
 
-or
+Then, navigate to the root directory of the project (where `setup.py` is located) and install the project dependencies using pip:
 
 ```bash
 pip install -e .[gpu]

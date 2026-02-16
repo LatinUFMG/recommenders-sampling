@@ -20,7 +20,6 @@ from recommenders.utils.constants import (
     DEFAULT_USER_COL,
     DEFAULT_ITEM_COL,
     DEFAULT_RATING_COL,
-    DEFAULT_TIMESTAMP_COL,
     DEFAULT_ISIMPR_COL,
     DEFAULT_IMPRGROUP_COL,
 )
@@ -121,7 +120,6 @@ def _load_interactions(path):
     df[DEFAULT_RATING_COL] = df[DEFAULT_RATING_COL].astype("int32")
 
     # Dummy fields for compatibility
-    df[DEFAULT_TIMESTAMP_COL] = "0"
     df[DEFAULT_ISIMPR_COL] = True
     df[DEFAULT_IMPRGROUP_COL] = df[DEFAULT_USER_COL]
 

@@ -531,11 +531,11 @@ class LightFMFModel(LightFMModel):
     def get_raytune_space(model_name: str = "lightfmf"):
         default_space = {
             "no_components": tune.randint(10, 201),  # Number of latent factors
-            "loss": tune.choice(["warp", "logistic"]),  # Loss function ["warp", "bpr", "logistic"]
-            "learning_schedule": tune.choice(["adadelta", "adagrad"]),  # Learning schedule ["adagrad", "adadelta"]
-            "learning_rate": tune.loguniform(3e-4, 1e-2),  # Learning rate step
-            "user_alpha": tune.loguniform(1e-4, 5e-1),  # Regularization for user factors
-            "item_alpha": tune.loguniform(1e-4, 5e-1),  # Regularization for item factors
+            "loss": tune.choice(["warp", "bpr", "logistic"]),  # Loss function
+            "learning_schedule": tune.choice(["adadelta"]),  # Learning schedule (adagrad)
+            "learning_rate": tune.loguniform(0.001, 0.01),  # Learning rate step
+            "user_alpha": tune.loguniform(1e-6, 1e-2),  # Regularization for user factors
+            "item_alpha": tune.loguniform(1e-6, 1e-2),  # Regularization for item factors
             "epochs": tune.randint(10, 51),  # Number of training epochs
         }
 
